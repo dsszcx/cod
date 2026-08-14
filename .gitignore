@@ -64,3 +64,7 @@ prior_mock/
 
 # cloned cod repo (avoid nested repo)
 cod/
+
+# SAM3 weights (large, 3.2GB)
+sam3-main/**/checkpoints/
+**/*.pt
