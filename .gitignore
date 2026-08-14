@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# PyTorch
+*.pth
+*.pth.tar
+*.pt
+*.ckpt
+!lib/pvtv2.py
+
+# Dataset (large files)
+Dataset/
+*.zip
+*.tar.gz
+
+# Model outputs
+model_pth/
+logs/
+*.log
+
+# Results
+*.png
+*.jpg
+!assets/*.png
+!assets/*.jpg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# GUI user data
+users.json
+
+# Backup files
+~$*
+*.bak
+
+
+# LLM prior outputs (large)
+prior/
+outputs/
+results_prior/
+prior_mock/
+
+# cloned cod repo (avoid nested repo)
+cod/
