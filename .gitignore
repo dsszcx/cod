@@ -68,3 +68,8 @@ cod/
 # SAM3 weights (large, 3.2GB)
 sam3-main/**/checkpoints/
 **/*.pt
+
+# SAM3 pipeline outputs
+sam3_regions/
+prior_sam3/
+results_sam3/

@@ -78,6 +78,33 @@ class QwenVLAnnotator:
         output_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         return self._parse_output(output_text)
 
+    def generate_with_text(self, image_path: str, prompt: str) -> dict:
+        # Ask a custom question about the image; return parsed JSON.
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant. Output only JSON."},
+            {"role": "user", "content": [
+                {"type": "image", "image": f"file://{os.path.abspath(image_path)}"},
+                {"type": "text", "text": prompt + " Only output JSON: {\"answer\": \"your choice\"}"},
+            ]},
+        ]
+        text = self.processor.apply_chat_template(messages, tokenize=False,
+                                                  add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = self.processor(text=[text], images=image_inputs, videos=video_inputs,
+                                padding=True, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            output_ids = self.model.generate(**inputs, max_new_tokens=self.max_tokens, do_sample=False)
+        generated_ids = [out[len(inp):] for inp, out in zip(inputs.input_ids, output_ids)]
+        output_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        import re as _re
+        m = _re.search(r'\{[^{}]*\}', output_text, _re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except json.JSONDecodeError:
+                pass
+        return {"answer": output_text.strip()[:50]}
+
     @staticmethod
     def _parse_output(text: str) -> dict:
         match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
