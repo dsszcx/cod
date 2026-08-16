@@ -102,6 +102,12 @@ def test(val_loader, model, epoch, save_path, best_state, prior_root):
                 target = torch.zeros(1, 352, 352)
                 aux = torch.zeros(3, 352, 352)
             gt_np = np.asarray(gt, np.float32) / 255.0
+            # resize priors to image size (352) for valid concat
+            if target.shape[-1] != image.shape[-1]:
+                target = F.interpolate(target.unsqueeze(0), size=image.shape[-2:],
+                                       mode="bilinear", align_corners=False).squeeze(0)
+                aux = F.interpolate(aux.unsqueeze(0), size=image.shape[-2:],
+                                    mode="bilinear", align_corners=False).squeeze(0)
             image = image.cuda()
             target = target.unsqueeze(0).cuda()
             aux = aux.unsqueeze(0).cuda()
