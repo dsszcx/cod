@@ -6,4 +6,3 @@ Pillow>=9.0.0
 matplotlib>=3.5.0
 timm>=0.6.0
 thop>=0.1.0
-py_sod_metrics>=0.1.0
