@@ -1,0 +1,32 @@
+version: relation_train_preparation_v1
+seed: 20261022
+paths:
+  train_pool: /srv/cod-workspace/Dataset/TrainValDataset
+  official_test: /srv/cod-workspace/Dataset/TestDataset
+  out_dir: outputs/RELATION_TRAIN_PREP_V1
+split:
+  val_fraction: 0.10
+  grouping: exact_image_sha256
+pilot:
+  train_images: 64
+  val_images: 16
+  purpose: pipeline_smoke_test_not_performance_conclusion
+proposed_training:
+  enabled: false
+  arms: [rgb, direct, relation]
+  initialization: shared_imagenet_backbone_and_seeded_random_decoder
+  historical_cod_checkpoint: null
+  input_size: 352
+  batch_size: 2
+  workers: 0
+  persistent_workers: false
+  epochs: 2
+  learning_rate: 0.0001
+  optimizer: AdamW
+  weight_decay: 0.0001
+  amp: false
+  augmentation: shared_seed_epoch_image_crop_flip_no_rotation
+  loss: shared_fixed_structure_bce_e_wiou_sum_four_outputs
+  validation: raw_sigmoid_no_per_image_minmax
+  selection: lowest_pilot_validation_mae_at_native_size
+  relation_role_hint: weak_not_hard_filter

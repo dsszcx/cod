@@ -1,0 +1,21 @@
+version: relation_cam_only_pilot_20261026_v1
+seed: 20261022
+data_scope: cam_only
+paths:
+  manifests: outputs/RELATION_CAM_ONLY_20261026_V1
+  imagenet: /srv/cod-workspace/pretrained/pvt_v2_b2.pth
+  out_dir: outputs/RELATION_CAM_ONLY_PILOT_20261026_V1
+expected_train_images: 38
+expected_val_images: 7
+arms: [rgb, direct, relation]
+epochs: 10
+input_size: 352
+batch_size: 2
+learning_rate: 0.0001
+weight_decay: 0.0001
+workers: 0
+amp: false
+node_geometry: false
+deterministic_algorithms: true
+# No training requested in the data-scope change; set a deadline before running.
+deadline_utc: null

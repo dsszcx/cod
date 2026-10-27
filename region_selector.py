@@ -26,6 +26,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 try:
     import cv2
@@ -251,13 +252,42 @@ def qwen_select(image_path, tags, masks, scores, qwen, max_aux=3, draw_dir=None,
 
 
 # ---------------- pipeline ----------------
+def _compact_prior(target, aux, size):
+    """Store the prior at `size` x `size` as uint8 0/1 (size=0 -> native float32).
+
+    Layer-0 evidence (2026-10): writing float32 masks at the ORIGINAL image
+    resolution with plain ``np.savez`` produced 78 GB for 8275 files (largest
+    single file 578 MB, images up to 3592x2386).  The training loader then
+    resized all of it back down to 352 for every sample.  Storing at ~1.27x the
+    training crop as uint8 + compressed turns that into a few hundred MB and
+    removes the per-sample giant resize entirely; every consumer
+    (dataloader_sam3._load_prior / load_test_prior) already accepts uint8 0/1.
+
+    BOX (area average) followed by "any coverage" (> 0) is max-pooling for a
+    binary mask, so thin target structures are never dropped.
+    """
+    if not size:
+        return target.astype(np.float32), aux.astype(np.float32)
+
+    def _one(m):
+        return np.stack([
+            (np.asarray(Image.fromarray((c > 0.5).astype(np.uint8) * 255)
+                        .resize((int(size), int(size)), Image.BOX)) > 0)
+            for c in m]).astype(np.uint8)
+
+    return _one(target), _one(aux)
+
+
 def process_split(regions_dir, out_dir, split, mode, qwen=None, image_root=None,
                   size=352, resume=True, min_target_ratio=0.005, conf_thresh=0.6,
-                  max_aux=3, draw_dir=None, max_cand=5, file_list=None):
+                  max_aux=3, draw_dir=None, max_cand=5, file_list=None,
+                  prior_size=448):
     """Process sam3_regions → prior_sam3.
 
     file_list: optional list of specific npz Paths to process (for multi-GPU shards).
                If None, auto-discovers all {split}_*.npz in regions_dir.
+    prior_size: resolution the prior masks are STORED at (0 = native resolution,
+                which is what produced the 78 GB directory).
     """
     regions_dir = Path(regions_dir)
     out_dir = Path(out_dir)
@@ -282,11 +312,13 @@ def process_split(regions_dir, out_dir, split, mode, qwen=None, image_root=None,
         if resume and out_path.exists():
             n_ok += 1
             continue
-        d = np.load(f, allow_pickle=True)
-        tags = [str(t) for t in d["tags"]]
-        masks = d["masks"]
-        scores = d["scores"]
-        bbox = d["bbox"]
+        # `with` closes the file descriptor: the old bare np.load() leaked one
+        # per npz (8275 per split, per run).
+        with np.load(f, allow_pickle=True) as d:
+            tags = [str(t) for t in d["tags"]]
+            masks = d["masks"]
+            scores = d["scores"]
+            bbox = d["bbox"]
 
         if len(masks) == 0:
             H = W = size
@@ -318,8 +350,11 @@ def process_split(regions_dir, out_dir, split, mode, qwen=None, image_root=None,
                 target_score = 0.0
                 n_gated += 1
 
-        np.savez(out_path, target_mask=target, aux_masks=aux,
-                 target_tag=np.array([target_tag], dtype=object), bbox=bbox)
+        target_out, aux_out = _compact_prior(target, aux, prior_size)
+        # compressed + uint8: 78 GB float32 directory -> a few hundred MB, see
+        # _compact_prior above.
+        np.savez_compressed(out_path, target_mask=target_out, aux_masks=aux_out,
+                            target_tag=np.array([target_tag], dtype=object), bbox=bbox)
         n_ok += 1
         if idx % 20 == 0:
             print(f"[{idx}/{len(files)}] done, target_tag={target_tag}")
@@ -341,12 +376,12 @@ def _run_shard_worker_rs(opt):
                   image_root=opt.image_root, resume=not opt.no_resume,
                   min_target_ratio=opt.min_target_ratio, conf_thresh=opt.conf_thresh,
                   max_aux=opt.max_aux, draw_dir=opt.draw_dir, max_cand=opt.max_cand,
-                  file_list=file_list)
+                  file_list=file_list, prior_size=opt.prior_size)
 
 
 def _run_multi_gpu_rs(gpus, regions_dir, split, out_dir, image_root,
                        qwen_model, resume, min_target_ratio, conf_thresh,
-                       max_aux, draw_dir, max_cand):
+                       max_aux, draw_dir, max_cand, prior_size=448):
     """Split npz files across GPUs, run each as a subprocess."""
     import subprocess, sys, tempfile
 
@@ -367,14 +402,15 @@ def _run_multi_gpu_rs(gpus, regions_dir, split, out_dir, image_root,
         shard_path = os.path.join(tmp_dir, f"shard_gpu{gid}.json")
         with open(shard_path, "w", encoding="utf-8") as f:
             json.dump(shards[i], f)
-        cmd = [sys.executable, os.path.abspath(__file__),
+        cmd = [sys.executable, "-u", os.path.abspath(__file__),
                "--shard_mode", "--gpu_id", str(gid), "--shard_files", shard_path,
                "--regions", str(regions_dir), "--out", str(out_dir),
                "--split", split, "--mode", "qwen",
                "--image_root", image_root, "--qwen_model", qwen_model,
                "--min_target_ratio", str(min_target_ratio),
                "--conf_thresh", str(conf_thresh),
-               "--max_aux", str(max_aux), "--max_cand", str(max_cand)]
+               "--max_aux", str(max_aux), "--max_cand", str(max_cand),
+               "--prior_size", str(prior_size)]
         if draw_dir:
             cmd += ["--draw_dir", draw_dir]
         if not resume:
@@ -383,12 +419,23 @@ def _run_multi_gpu_rs(gpus, regions_dir, split, out_dir, image_root,
         env["CUDA_VISIBLE_DEVICES"] = str(gid)
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         print(f"  GPU {gid}: {len(shards[i])} npz files")
-        procs.append(subprocess.Popen(cmd, env=env))
-    for p in procs:
-        p.wait()
+        procs.append((gid, len(shards[i]), subprocess.Popen(cmd, env=env)))
+    failed = []
+    for gid, n_shard, p in procs:
+        rc = p.wait()
+        if rc != 0:
+            failed.append((gid, rc, n_shard))
     shutil.rmtree(tmp_dir, ignore_errors=True)
     n_done = len(list(out_dir.glob(f"{split}_*.npz")))
     print(f">>> Multi-GPU done! {n_done} npz files in {out_dir}")
+    if failed:
+        # Silent shard death used to look exactly like a successful run: the
+        # missing npz just fell back to an all-zero prior at training time.
+        for gid, rc, n_shard in failed:
+            print(f">>> ERROR: GPU {gid} shard ({n_shard} files) exited with "
+                  f"code {rc}; its npz are missing -> raise or re-run with "
+                  f"--out resume")
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
@@ -398,7 +445,7 @@ if __name__ == "__main__":
     parser.add_argument("--split", type=str, default="train", choices=["train", "test"])
     parser.add_argument("--mode", type=str, default="heuristic", choices=["qwen", "heuristic"])
     parser.add_argument("--image_root", type=str, default=None)
-    parser.add_argument("--qwen_model", type=str, default="/home/16t/cr/sr/chatsr/Qwen2.5-VL-3B-Instruct/")
+    parser.add_argument("--qwen_model", type=str, default="/opt/models/Qwen2.5-VL-3B-Instruct/")
     parser.add_argument("--min_target_ratio", type=float, default=0.005)
     parser.add_argument("--conf_thresh", type=float, default=0.6)
     parser.add_argument("--max_aux", type=int, default=3)
@@ -407,6 +454,12 @@ if __name__ == "__main__":
     parser.add_argument("--gpus", type=str, default="0",
                         help="comma-separated GPU IDs for parallel qwen mode")
     parser.add_argument("--no_resume", action="store_true")
+    parser.add_argument("--prior_size", type=int, default=448,
+                        help="store prior masks at this square resolution as uint8 0/1 "
+                             "(default 448 = 1.27x the 352 training crop). 0 keeps the "
+                             "legacy native-resolution float32 format, which produced "
+                             "78 GB for 8275 files and slowed the loader to "
+                             "p99 ~1 s/sample.")
     parser.add_argument("--shard_mode", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--gpu_id", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--shard_files", type=str, default=None, help=argparse.SUPPRESS)
@@ -420,7 +473,8 @@ if __name__ == "__main__":
             assert opt.image_root is not None, "--image_root required for qwen mode"
             _run_multi_gpu_rs(gpu_list, opt.regions, opt.split, opt.out, opt.image_root,
                               opt.qwen_model, not opt.no_resume, opt.min_target_ratio,
-                              opt.conf_thresh, opt.max_aux, opt.draw_dir, opt.max_cand)
+                              opt.conf_thresh, opt.max_aux, opt.draw_dir, opt.max_cand,
+                              prior_size=opt.prior_size)
         else:
             qwen = None
             if opt.mode == "qwen":
@@ -431,4 +485,5 @@ if __name__ == "__main__":
                           image_root=opt.image_root, resume=not opt.no_resume,
                           min_target_ratio=opt.min_target_ratio,
                           conf_thresh=opt.conf_thresh, max_aux=opt.max_aux,
-                          draw_dir=opt.draw_dir, max_cand=opt.max_cand)
+                          draw_dir=opt.draw_dir, max_cand=opt.max_cand,
+                          prior_size=opt.prior_size)

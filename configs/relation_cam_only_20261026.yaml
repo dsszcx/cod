@@ -1,0 +1,10 @@
+version: relation_cam_only_20261026_v1
+seed: 20261022
+data_scope: cam_only
+paths:
+  source_manifests: outputs/RELATION_TRAIN_PREP_V1
+  official_test: /srv/cod-workspace/Dataset/TestDataset
+  out_dir: outputs/RELATION_CAM_ONLY_20261026_V1
+create_symlink_view: true
+selection: dataset_category_only_exclude_NonCAM_no_GT_or_prediction_filter
+split: preserve_existing_train_val_membership_no_resampling

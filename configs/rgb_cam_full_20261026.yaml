@@ -1,0 +1,21 @@
+version: rgb_cam_full_v1
+seed: 20261022
+data_scope: cam_only
+paths:
+  manifests: /srv/cod-project/outputs/RELATION_CAM_ONLY_20261026_V1
+  imagenet: /srv/cod-workspace/pretrained/pvt_v2_b2.pth
+  out_dir: /srv/cod-project/outputs/RGB_CAM_FULL_20261026_V1
+expected_train_images: 3652
+expected_val_images: 383
+epochs: 80
+input_size: 352
+batch_size: 8
+learning_rate: 0.0001
+weight_decay: 0.0001
+lr_milestones: [30, 60]
+lr_gamma: 0.1
+deterministic_algorithms: true
+metric_workers: 4
+checkpoint_selection: raw_val_mae
+# PVTv2 RGB-only development baseline, NOT official SINet training reproduction.
+# Fresh ImageNet initialization; do not warm-start from the 1-epoch acceptance.

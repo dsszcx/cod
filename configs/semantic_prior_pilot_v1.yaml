@@ -1,0 +1,23 @@
+version: semantic_prior_pilot_v1
+paths:
+  data_root: /srv/cod-workspace/Dataset/TestDataset
+  source_manifest: outputs/MASK_PROMPT_P0_20261022/INPUT_MANIFEST.csv
+  qwen_model: /opt/models/Qwen2.5-VL-3B-Instruct
+  sam3_ckpt: /srv/cod-workspace/sam3-main/sam3-main/checkpoints/sam3.pt
+  out_dir: outputs/SEMANTIC_PRIOR_PILOT_V1
+sample:
+  per_group: 3
+  groups: [CAMO, COD10K-CAM, COD10K-NonCAM]
+tags:
+  max_tags: 8
+  max_words: 6
+  max_tokens: 512
+  retry_invalid: 1
+  prompt_version: semantic_components_no_concrete_example_v1
+sam3:
+  confidence_threshold: 0.5
+  max_masks_per_tag: 2
+selection:
+  max_aux: 3
+  output_size: 448
+  max_tokens: 1400

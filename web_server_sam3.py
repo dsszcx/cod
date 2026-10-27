@@ -6,6 +6,18 @@ Then open http://127.0.0.1:8091
 
 Upload an image -> if a prior exists in prior_sam3/, use target+aux;
 otherwise fall back to zero prior (network segments autonomously).
+POST /predict?name=<original file name> makes the prior lookup deterministic
+(without it the demo always shows the autonomous / no-prior behaviour).
+
+Layer-0 notes (2026-10):
+  * the prior is resolved by dataloader_sam3.load_test_prior and goes through the
+    shared dataloader_sam3.prepare_prior_at, so the demo sees exactly the same
+    input distribution as training/inference (one resolver for all entry points).
+  * a missing prior npz is reported on stdout before falling back to zeros
+    (autonomous mode); the demo used to show nothing at all about coverage.
+  * the checkpoint is channel-checked (a 7ch file used to load silently and the
+    demo would look "trained but bad" instead of reporting the mismatch).
+  * --pth MUST point at a checkpoint produced by MyTrain_SAM3.py (8ch+fusion).
 """
 import argparse
 import base64
@@ -13,6 +25,7 @@ import io
 import json
 import os
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
@@ -21,6 +34,8 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from PIL import Image
 
+from dataloader_sam3 import is_noncam, load_test_prior, prepare_prior_at
+from check_ckpt_channels import load_with_report
 from Network_SAM3 import Network
 
 MAX_UPLOAD = 15 * 1024 * 1024
@@ -40,9 +55,12 @@ img_transform = transforms.Compose([
 def load_model(pth_path):
     global model, device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = Network(channel=64)
+    # The checkpoint supplies every weight -> skip the ImageNet load (a missing
+    # ./pretrained/pvt_v2_b2.pth must not take the demo server down).
+    model = Network(channel=64, imagenet_pretrained=False)
     if os.path.exists(pth_path):
-        model.load_state_dict(torch.load(pth_path, map_location=device), strict=False)
+        # Layer-0 guard: only an 8ch + prior_fusion checkpoint may be loaded
+        load_with_report(model, pth_path, expected=8)
         print(f">>> Model loaded: {pth_path}")
     else:
         print(f">>> WARNING: {pth_path} not found")
@@ -50,35 +68,45 @@ def load_model(pth_path):
 
 
 def get_prior(img_name):
-    """Try to load target+aux prior for an image by basename."""
-    base = os.path.basename(img_name)
-    stem = os.path.splitext(base)[0]
-    for tag in ["test_", "train_"]:
-        npz = os.path.join(PRIOR_ROOT, f"{tag}{stem.replace('.', '_')}.npz")
-        if os.path.exists(npz):
-            d = np.load(npz, allow_pickle=True)
-            return torch.from_numpy(d["target_mask"]).float(), torch.from_numpy(d["aux_masks"]).float()
-    # no prior
-    return torch.zeros(1, 1, 1), torch.zeros(3, 1, 1)
+    """Load target+aux prior for an image by basename -> (target, aux, found).
+
+    Goes through ``dataloader_sam3.load_test_prior`` (the single resolver used by
+    MyTrain_SAM3 / MyTest_SAM3), so the ``.jpg``/``.png`` npz naming and the
+    full-path case cannot diverge between entry points again. The returned masks
+    are already resized to 352 and binarized at 0.5.
+    """
+    base = os.path.basename(img_name or "")
+    if base:
+        for split in ("test", "train"):
+            target, aux, found = load_test_prior(split, base, PRIOR_ROOT, (352, 352))
+            if found:
+                return target, aux, True
+    # no prior for this image (demo falls back to autonomous / zero-prior mode)
+    return torch.zeros(1, 352, 352), torch.zeros(3, 352, 352), False
 
 
-def predict(image_bytes):
+def predict(image_bytes, img_name=None):
+    """img_name: original file name (e.g. camourflage_00001.jpg) so the matching
+    prior_sam3/*.npz can be found; None -> zero prior (autonomous mode)."""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
     x = img_transform(img).unsqueeze(0).to(device)
 
-    target, aux = get_prior(img_name="upload.jpg")
-    # fallback: no prior -> zeros sized 352
-    if target.numel() == 1:
-        target = torch.zeros(1, 352, 352)
-        aux = torch.zeros(3, 352, 352)
-    target = F.interpolate(target.unsqueeze(0), size=(352, 352), mode="bilinear",
-                           align_corners=False).to(device)
-    aux = F.interpolate(aux.unsqueeze(0), size=(352, 352), mode="bilinear",
-                        align_corners=False).to(device)
+    target, aux, prior_found = get_prior(img_name or "")
+    if not prior_found:
+        # Layer-0: never fall back to zeros silently -- say so in the log
+        print(f">>> [prior] no npz for {img_name!r} under {PRIOR_ROOT} "
+              f"-> zero prior (autonomous mode)")
+    # Layer-0: same resize+binarize path as training and MyTest_SAM3
+    target, aux = prepare_prior_at(target, aux, (352, 352))
+    target = target.unsqueeze(0).to(device)
+    aux = aux.unsqueeze(0).to(device)
 
     with torch.no_grad():
-        _, _, _, c4 = model(x, target, aux)
+        # same 'NonCAM' rule as the training loader (0 when the name is unknown)
+        neg_flag = torch.full((1, 1, x.shape[-2], x.shape[-1]),
+                              float(is_noncam(img_name or "")), device=x.device)
+        _, _, _, c4 = model(x, target, aux, neg_flag)
 
     res = F.interpolate(c4, size=(h, w), mode="bilinear", align_corners=False)
     res = res.sigmoid().squeeze().cpu().numpy()
@@ -127,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(b"404", "text/plain")
 
     def do_POST(self):
-        if self.path != "/predict":
+        if not self.path.startswith("/predict"):
             self._send(b"404", "text/plain")
             return
         length = int(self.headers.get("Content-Length", 0))
@@ -137,7 +165,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             t0 = time.time()
-            result_bytes = predict(body)
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            result_bytes = predict(body, img_name=qs.get("name", [None])[0])
             elapsed = (time.time() - t0) * 1000
             payload = json.dumps({
                 "status": "ok",
@@ -158,7 +187,9 @@ class WebServer(ThreadingHTTPServer):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8091)
-    parser.add_argument("--pth", type=str, default="./model_pth/SAM3/KKK_best_41.pth")
+    parser.add_argument("--pth", type=str, default="./model_pth/SAM3/KKK_best_41.pth",
+                        help="MUST be an 8ch + prior_fusion checkpoint written by "
+                             "MyTrain_SAM3.py (validated by check_ckpt_channels.py)")
     parser.add_argument("--prior_root", type=str, default="./prior_sam3")
     opt = parser.parse_args()
 

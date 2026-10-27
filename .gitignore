@@ -21,6 +21,7 @@ env/
 
 # Dataset (large files)
 Dataset/
+COD10K-v2/
 *.zip
 *.tar.gz
 
@@ -47,6 +48,7 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+.test_tmp/
 
 # GUI user data
 users.json
@@ -72,4 +74,52 @@ sam3-main/**/checkpoints/
 # SAM3 pipeline outputs
 sam3_regions/
 prior_sam3/
+prior_sam3_*/
 results_sam3/
+results_sam3_*/
+
+# Local data, generated packages and external checkouts (keep on disk)
+/pretrained/
+/results*/
+/data_archives/*
+!/data_archives/README.md
+/releases/*
+!/releases/README.md
+/references/upstream/
+/sam3-main/
+/docs/references/伪装目标检测论文2021.md
+*.npz
+*.npy
+*.safetensors
+*.bin
+*.onnx
+*.h5
+*.hdf5
+*.tfevents*
+*.7z
+*.rar
+*.tar
+*.tgz
+*.pdf
+*.gif
+*.mp4
+*.avi
+*.jpeg
+*.tif
+*.tiff
+
+# Local credentials, account state and machine-specific overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.ssh/
+.aws/
+.codex/
+.agents/
+credentials*.json
+secrets*.json
+/configs/local/

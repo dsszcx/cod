@@ -1,0 +1,108 @@
+# E0-E4 inference-only pipeline -- FROZEN pre-registration (v1)
+# ---------------------------------------------------------------------------
+# Every value below is fixed BEFORE Gate C runs.  Changing any of them after
+# Gate C has started invalidates the round: bump `version`, write a new file and
+# re-run Gate C.  `tools/e0e4/preflight.py` records the sha256 of this file into
+# CHECKPOINT_SHA256.txt / PREFLIGHT_REPORT.md, and `run_e0e4.py` copies it to
+# <out>/RUN_LOGS/CONFIG_LOCKED.yaml so a result folder can never be separated
+# from the settings that produced it.
+#
+# Source of truth: docs/project/现行要求.md (2026-10-20).
+# ---------------------------------------------------------------------------
+version: e0e4_v1
+seed: 20261020
+
+paths:
+  data_root: Dataset/TestDataset
+  datasets: [CAMO, COD10K]
+  out_dir: outputs/E0_E4_ZEROTRAIN_V1
+  # 3-channel baseline.  NOT the checkpoint log.log calls "best":
+  #   model_pth/OUR/log.log prints MAE=46.076... (GT kept in 0..255 vs a 0..1
+  #   prediction; 46.076/255 = 0.1807 = CAMO GT foreground ratio) and
+  #   "Best Epoch: 0", so its selection is broken.  Net_epoch_40.pth is
+  #   pre-registered as the fixed, training-complete 3ch baseline instead.
+  e0_ckpt: model_pth/OUR/Net_epoch_40.pth
+  qwen_model: /opt/models/Qwen2.5-VL-3B-Instruct
+  sam3_ckpt: sam3-main/sam3-main/checkpoints/sam3.pt
+
+# Test-time strata.  "NonCAM" is only used to *stratify the report*; it is
+# never allowed to skip an image (that is GT/label leakage).
+groups:
+  CAMO: CAMO
+  COD10K-CAM: COD10K non-NonCAM
+  COD10K-NonCAM: COD10K NonCAM
+
+manifest:
+  p0_per_group: 10          # Gate C: 10 / 10 / 10 = 30
+  p1:
+    CAMO: 50
+    COD10K-CAM: 100
+    COD10K-NonCAM: 50       # Gate D/E: 200
+  # P1 is drawn from the *complement* of P0 with the same seed; no image ever
+  # gets replaced because it produced a bad result.
+
+e0:
+  input_size: 352
+  threshold: 0.5
+  interpolation: bilinear
+  align_corners: false
+  # All 740-key checkpoints in model_pth/ predate ChannelAttention inside GRA:
+  # the only missing keys are RS*.{weak,medium,strong}_gra.ca.fc.* (18 total).
+  # use_ca=False rebuilds exactly the trained architecture and strict-loads
+  # 740/740; leaving it true would silently random-initialise 18 CA layers.
+  use_ca: false
+  # min-max is OFF: the historical per-image stretch made the 3ch row and the
+  # SAM3 row incomparable (see eval_metrics.py docstring).
+  minmax: false
+
+roi:
+  # ROI source is M0_binary only -- never GT.
+  threshold: 0.5
+  min_pixels: 100
+  min_area_fraction: 0.0005
+  max_roi: 3
+  pad_fraction: 0.12
+  composite_max_panel_h: 448
+
+qwen:
+  max_tokens: 192
+  temperature: 0.0
+  max_text_words: 6
+  max_text_chars: 80
+  retry_on_parse_error: 1     # at most 2 calls per image, same prompt
+  prompt_version: e0e4_prompt_v1
+
+sam3:
+  confidence_threshold: 0.5
+  dtype: bfloat16
+  max_prompt_chars: 80
+
+e4:
+  # Fixed, non-GT fusion.  The ONLY tunable here is pre-registered in this
+  # file; Stage E4 must not re-tune on the test set.
+  match_iou: 0.30
+  box_dilate_fraction: 0.10
+  min_candidate_pixels: 16
+  fallback: e0
+
+eval:
+  pred_protocol: raw
+  gt_ext: .png
+  main_metrics: [mae, sm, avgem, wfm]
+  extra_metrics: [adpem, adpiou, adpdice]
+  bootstrap_n: 2000
+  bootstrap_alpha: 0.05
+  bootstrap_seed: 20261020
+  review_samples: 60
+
+# ---------------------------------------------------------------------------
+# Hard guards.  Any `true` here makes preflight / run_e0e4 refuse to run: the
+# whole point of this round is an inference-only, non-GT, non-tuned comparison.
+# ---------------------------------------------------------------------------
+guards:
+  allow_gt_during_inference: false
+  allow_filename_context: false
+  allow_noncam_skip: false
+  allow_minmax_output: false
+  allow_stage_local_threshold_tuning: false
+  allow_extra_fusion_rules: false

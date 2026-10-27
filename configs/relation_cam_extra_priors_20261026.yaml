@@ -1,0 +1,17 @@
+version: relation_cam_extra_priors_20261026_v1
+expected_images: 115
+paths:
+  source_manifest: outputs/RELATION_CAM_EXTENDED_20261026_V1/MISSING_PRIOR_INPUT.csv
+  out_dir: outputs/RELATION_CAM_EXTRA_PRIORS_20261026_V1
+  qwen_model: /opt/models/Qwen2.5-VL-3B-Instruct
+  sam3_ckpt: /srv/cod-workspace/sam3-main/sam3-main/checkpoints/sam3.pt
+  package_output: outputs/RELATION_CAM_EXTENDED_20261026_V1/priors
+tags:
+  max_tags: 8
+  max_words: 6
+  max_tokens: 700
+  retry_invalid: 1
+  prompt_version: concrete_components_no_example_v2
+sam3:
+  confidence_threshold: 0.5
+  max_masks_per_tag: 2

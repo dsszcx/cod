@@ -131,13 +131,37 @@ class NeighborConnectionDecoder(nn.Module):
         return x
 
 
+class ChannelAttention(nn.Module):
+    """轻量级通道注意力（SE模块变体），用于增强GRA特征交互。"""
+    def __init__(self, channel, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, max(channel // reduction, 8), bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(max(channel // reduction, 8), channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
 class GRA(nn.Module):
-    def __init__(self, channel, subchannel):
+    def __init__(self, channel, subchannel, use_ca=True):
         super(GRA, self).__init__()
         self.group = channel // subchannel
         self.conv = nn.Sequential(
             nn.Conv2d(channel + self.group, channel, 3, padding=1), nn.ReLU(True),
         )
+        # use_ca=False reproduces the architecture of the 740-key checkpoints in
+        # model_pth/ (they predate ChannelAttention: the 18 missing keys are
+        # exactly RS*.{weak,medium,strong}_gra.ca.fc.*).  Default stays True so
+        # training and every existing entry point keep their key set unchanged.
+        self.ca = ChannelAttention(channel) if use_ca else None
         self.score = nn.Conv2d(channel, 1, 3, padding=1)
 
     def forward(self, x, y):
@@ -148,17 +172,19 @@ class GRA(nn.Module):
             x_cat = torch.cat([v for t in zip(xs, [y] * self.group) for v in t], dim=1)
 
         x = x + self.conv(x_cat)
+        if self.ca is not None:
+            x = self.ca(x)  # 通道注意力增强
         y = y + self.score(x)
 
         return x, y
 
 
 class ReverseStage(nn.Module):
-    def __init__(self, channel):
+    def __init__(self, channel, use_ca=True):
         super(ReverseStage, self).__init__()
-        self.weak_gra = GRA(channel, channel)
-        self.medium_gra = GRA(channel, 8)
-        self.strong_gra = GRA(channel, 1)
+        self.weak_gra = GRA(channel, channel, use_ca=use_ca)
+        self.medium_gra = GRA(channel, 8, use_ca=use_ca)
+        self.strong_gra = GRA(channel, 1, use_ca=use_ca)
 
     def forward(self, x, y):
         y = -1 * (torch.sigmoid(y)) + 1
@@ -169,16 +195,16 @@ class ReverseStage(nn.Module):
 
 
 class Network(nn.Module):
-    def __init__(self, channel=32, imagenet_pretrained=True):
+    def __init__(self, channel=32, imagenet_pretrained=True, use_ca=True):
         super(Network, self).__init__()
         self.backbone = pvt_v2_b2(pretrained=imagenet_pretrained)
         self.rfb2_1 = RFB_modified(128, channel)
         self.rfb3_1 = RFB_modified(320, channel)
         self.rfb4_1 = RFB_modified(512, channel)
         self.NCD = NeighborConnectionDecoder(channel)
-        self.RS5 = ReverseStage(channel)
-        self.RS4 = ReverseStage(channel)
-        self.RS3 = ReverseStage(channel)
+        self.RS5 = ReverseStage(channel, use_ca=use_ca)
+        self.RS4 = ReverseStage(channel, use_ca=use_ca)
+        self.RS3 = ReverseStage(channel, use_ca=use_ca)
 
     def forward(self, x):
         endpoints = self.backbone.extract_endpoints(x)

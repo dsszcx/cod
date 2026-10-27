@@ -1,0 +1,9 @@
+version: relation_cam_extended_20261026_v1
+seed: 20261022
+data_scope: cam_only
+paths:
+  source_manifests: outputs/RELATION_CAM_ONLY_20261026_V1
+  out_dir: outputs/RELATION_CAM_EXTENDED_20261026_V1
+pilot:
+  train_images: 128
+  val_images: 32

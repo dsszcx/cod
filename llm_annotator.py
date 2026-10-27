@@ -77,6 +77,22 @@ BACKGROUND_TAGS = {"rock","ground","texture","soil","tree bark","leaf",
     "moss","dirt","stone","pebble","earth","floor","wall","branch",
     "trunk","stem","petal","flower"}
 
+# Words a 3B model uses instead of naming an object ("background" was actually
+# seen in the prescreen output).  They are filtered by _normalize_items on top
+# of BACKGROUND_TAGS: a tag here would otherwise be pushed into SAM3 as a text
+# prompt (Step2 --prompt_mode hybrid) and simply waste a forward pass.
+NON_OBJECT_TAGS = {"background", "foreground", "none", "unknown", "nothing",
+    "object", "something", "camouflage", "camouflaged object"}
+
+# Prose/refusal patterns.  They only guard the free-text branch of
+# _parse_multi_target: answering the legacy open-ended prompt with
+# "I cannot see any camouflaged object" used to store that whole sentence as a
+# tag.  \b keeps real nouns safe (hare/pig/wasp/spider do not match).
+_JUNK_DESC_RE = re.compile(
+    r"\b(cannot|can't|can not|unable|sorry|please|not sure|no camouflag|"
+    r"there is no|there are no|is|are|was|were|appears|looks|seems|shown|"
+    r"visible|image|photo|picture|brightness|color)\b", re.I)
+
 # --------------- OpenCV saliency / pre-screening ---------------
 
 def opencv_detect_candidates(image_path, max_cand=5, min_area_ratio=0.005,
@@ -176,6 +192,61 @@ def opencv_detect_candidates(image_path, max_cand=5, min_area_ratio=0.005,
             break
 
     return [c["bbox"] for c in merged]
+
+
+def fallback_boxes(image_path, max_cand=5, mode="quad"):
+    """Boxes used when opencv_detect_candidates() returns nothing.
+
+    The 3B model cannot find + locate + name a camouflaged object in one
+    open-ended shot -- that path produced the 2026-10-15 "SKIP (no tags)" flood
+    and the "[1, 2]" junk that crashed the parser.  It CAN name an object inside
+    a *given* box, and SAM3 turns a loose box into a mask, so when the saliency
+    proposer comes up empty we hand over the whole image (plus overlapping
+    quadrants, for context) instead of dropping to the open-ended prompt.
+
+    mode: "quad"  -> whole image + 4 quadrants (12% overlap, so an object sitting
+                     on a quadrant border is not cut in half)
+          "whole" -> whole image only
+          "off"   -> [] (caller falls back to legacy)
+
+    Returns [[x1,y1,x2,y2], ...] with the whole-image box first, or [] when the
+    image cannot be read at all.
+    """
+    if mode == "off":
+        return []
+    w = h = 0
+    if _CV2_OK:
+        img = cv2.imread(image_path)
+        if img is not None:
+            h, w = img.shape[:2]
+    if not w or not h:
+        try:
+            from PIL import Image
+            with Image.open(image_path) as im:
+                w, h = im.size
+        except Exception:
+            return []
+    if not w or not h:
+        return []
+    whole = [0, 0, int(w), int(h)]
+    if mode == "whole" or max_cand <= 1:
+        return [whole]
+
+    mx, my = int(w * 0.12), int(h * 0.12)          # quadrant overlap margin
+    hw, hh = int(w / 2), int(h / 2)
+    quads = [
+        [0, 0, min(int(w), hw + mx), min(int(h), hh + my)],    # top-left
+        [max(0, hw - mx), 0, int(w), min(int(h), hh + my)],    # top-right
+        [0, max(0, hh - my), min(int(w), hw + mx), int(h)],    # bottom-left
+        [max(0, hw - mx), max(0, hh - my), int(w), int(h)],    # bottom-right
+    ]
+    boxes = [whole]
+    for b in quads:
+        if len(boxes) >= max_cand:
+            break
+        if (b[2] - b[0]) > 0 and (b[3] - b[1]) > 0:
+            boxes.append([int(v) for v in b])
+    return boxes
 
 
 def _bbox_iou(b1, b2):
@@ -296,16 +367,17 @@ def _parse_prescreen_output(text, boxes):
                 if tags:
                     results.append({"tags": tags, "bbox": _validate_bbox(boxes[idx])})
 
-    # If parsing failed entirely, try legacy parser
+    # If parsing failed entirely, try legacy parser (normalised: a bare index list
+    # such as "[1, 2]" is junk, not an object description -> [] instead of a crash)
     if not results:
-        return _parse_multi_target(text)
+        return _normalize_items(_parse_multi_target(text))
 
-    return results
+    return _normalize_items(results)
 
 
 def _validate_bbox(bbox, img_w=0, img_h=0):
     """Validate and clamp bbox to image bounds.
-    
+
     When img_w/img_h are provided and >0, checks minimum area (0.1% of image).
     When img_w/img_h are 0 (unknown), only does basic clamping.
     """
@@ -320,16 +392,84 @@ def _validate_bbox(bbox, img_w=0, img_h=0):
         x2,y2 = max(x1+1,x2), max(y1+1,y2)
     return [x1,y1,x2,y2]
 
+def _is_junk_desc(desc):
+    """True when a free-text fragment is prose/refusal, not an object name.
+
+    Guards the free-text branch of _parse_multi_target only.  The legacy
+    open-ended prompt made the 3B model answer things like "I cannot see any
+    camouflaged object in this image" or "brightness changes"; storing those as
+    tags then pushed a full sentence into SAM3 as a text prompt (Step2).
+    """
+    return bool(_JUNK_DESC_RE.search(desc)) or len(desc.split()) > 6
+
+
+def _normalize_items(items):
+    """Coerce parser output into [{"tags": [str], "bbox": [x1,y1,x2,y2]}].
+
+    Root cause of the 2026-10-15 server crash: Qwen answered with a bare JSON
+    array of indices ("[1, 2]"), _parse_multi_target returned it verbatim and
+    prescreen_generate_multi called r.get("tags") on an int ->
+    AttributeError: 'int' object has no attribute 'get'.
+
+    Anything that is not a usable object description (int / None / nested list /
+    empty or background-only tags) is dropped here, so a junk reply degrades to
+    an empty list -- which every caller already handles -- instead of raising.
+    """
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, (list, tuple)):
+        return []
+    out = []
+    for it in items:
+        if isinstance(it, dict):
+            tags, bbox = it.get("tags"), it.get("bbox")
+        elif isinstance(it, str):
+            tags, bbox = [it], None
+        else:
+            continue                      # int / None / nested list: not an object
+        if isinstance(tags, str):
+            tags = [tags]
+        if not isinstance(tags, (list, tuple)):
+            continue
+        clean = []
+        for t in tags:
+            if not isinstance(t, str):
+                continue
+            t = t.strip().strip("\"'.").strip()
+            if not t or len(t) >= 60:
+                continue
+            if t.isdigit():                     # a bare index ("1") is not a name
+                continue
+            if t.lower() in BACKGROUND_TAGS or t.lower() in NON_OBJECT_TAGS:
+                continue
+            if t not in clean:
+                clean.append(t)
+        if not clean:
+            continue
+        try:
+            if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+                bbox = [0, 0, 0, 0]
+            bbox = _validate_bbox([int(v) for v in bbox])
+        except (TypeError, ValueError):
+            bbox = [0, 0, 0, 0]
+        out.append({"tags": clean, "bbox": bbox})
+    return out
+
+
 def _parse_multi_target(text):
     text = re.sub(r"```json\s*", "", text)
     text = re.sub(r"```\s*", "", text).strip()
     try:
         d = json.loads(text)
-        if isinstance(d, list) and d: return d
-        if isinstance(d, dict): return [d]
+        if isinstance(d, list) and d: return _normalize_items(d)
+        if isinstance(d, dict): return _normalize_items([d])
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
-    parts = re.split(r"\)\s*,\s*|\]\s*,\s*|\n", text)
+    # Split between items WITHOUT consuming the closing bracket: the old
+    # r"\]\s*,\s*" ate the "]" of everything but the last item, so
+    # "fox [68,73,279,274], lizard [...]" lost the fox box (it silently became
+    # a tag without coordinates).  Lookbehind keeps the "]" inside the part.
+    parts = re.split(r"(?<=\])\s*,\s*|\)\s*,\s*|\n", text)
     results = []
     for part in parts:
         part = part.strip().strip(",").strip()
@@ -341,11 +481,11 @@ def _parse_multi_target(text):
             if tags: results.append({"tags":tags,"bbox":_validate_bbox(bbox)})
         else:
             desc = re.sub(r"[\[\]\d,;]", "", part).strip().strip("\'")
-            if desc and len(desc)<50 and desc.lower() not in BACKGROUND_TAGS:
+            desc = re.sub(r"^[\s\)\]\.\:]+", "", desc).strip()   # leftover "1)" numbering
+            if desc and len(desc) < 50 and not _is_junk_desc(desc):
                 results.append({"tags":[desc],"bbox":[0,0,0,0]})
-    for r in results:
-        r["tags"] = [t for t in r["tags"] if t.lower() not in BACKGROUND_TAGS]
-    return [r for r in results if r.get("tags")]
+    # Single normalisation point for the regex/line-parsed branch as well.
+    return _normalize_items(results)
 
 class QwenVLAnnotator:
     def __init__(self, model_path="Qwen/Qwen2.5-VL-3B-Instruct", device="auto",
@@ -387,18 +527,33 @@ class QwenVLAnnotator:
         return _parse_multi_target(output_text)
 
     # ---- prescreen mode: OpenCV detects, Qwen names ----
-    def prescreen_generate(self, image_path, max_cand=5, tmp_dir=None):
+    def prescreen_generate(self, image_path, max_cand=5, tmp_dir=None,
+                           box_fallback="quad"):
         """OpenCV detects candidate boxes → draw numbered boxes → Qwen names each.
 
         Returns list of {"tags": [...], "bbox": [x1,y1,x2,y2]}, same format
         as legacy generate().
+
+        box_fallback (2026-10-15) decides what happens when the proposer finds
+        nothing or the reply cannot be parsed:
+          "quad"/"whole" -> keep asking about GIVEN boxes (fallback_boxes); the
+                            open-ended prompt is then only used when the image
+                            itself is unreadable -- it is the path that produced
+                            the SKIP flood, so it must not be the first resort.
+          "off"          -> legacy behaviour (open-ended prompt, old bugs).
         """
-        # Step 1: OpenCV saliency detection
+        # Step 1: OpenCV saliency detection, then the box fallback
         boxes = opencv_detect_candidates(image_path, max_cand=max_cand)
+        if not boxes and box_fallback != "off":
+            boxes = fallback_boxes(image_path, max_cand=max_cand,
+                                   mode=box_fallback)
+            if boxes:
+                print(f"  [prescreen] OpenCV empty -> {len(boxes)} "
+                      f"{box_fallback} fallback box(es)")
 
         if not boxes:
-            # Fallback to legacy mode if OpenCV finds nothing
-            print(f"  [prescreen] OpenCV found no candidates, fallback to legacy")
+            # Image unreadable (or --box_fallback off): legacy open-ended mode
+            print(f"  [prescreen] no usable box, fallback to legacy")
             return self.generate(image_path)
 
         # Step 2: Enhance image for Qwen
@@ -407,25 +562,31 @@ class QwenVLAnnotator:
             enhanced_path = enhance_image_for_qwen(
                 image_path, os.path.join(tmp_dir, "enhanced.jpg"))
 
-        # Step 3: Draw numbered boxes
-        draw_path = enhanced_path
-        if _CV2_OK and tmp_dir:
-            drawn = draw_numbered_boxes(
-                enhanced_path, boxes,
-                os.path.join(tmp_dir, "numbered.jpg"))
-            if drawn:
-                draw_path = drawn
+        # Steps 3-5: draw numbered boxes -> Qwen names each region -> parse
+        def _ask(boxes_, tag):
+            draw_path = enhanced_path
+            if _CV2_OK and tmp_dir:
+                drawn = draw_numbered_boxes(
+                    enhanced_path, boxes_,
+                    os.path.join(tmp_dir, f"numbered_{tag}.jpg"))
+                if drawn:
+                    draw_path = drawn
+            user_prompt = PRESCREEN_USER_PROMPT_TEMPLATE.format(n=len(boxes_))
+            output_text = self._call_model(
+                draw_path, PRESCREEN_SYSTEM_PROMPT, user_prompt, max_tokens=150)
+            print(f"  [prescreen] Qwen raw ({tag}): {output_text!r}")
+            return _parse_prescreen_output(output_text, boxes_)
 
-        # Step 4: Qwen names each region (simple task for 3B)
-        n = len(boxes)
-        user_prompt = PRESCREEN_USER_PROMPT_TEMPLATE.format(n=n)
-        output_text = self._call_model(
-            draw_path, PRESCREEN_SYSTEM_PROMPT, user_prompt, max_tokens=150)
+        results = _ask(boxes, "boxes")
 
-        print(f"  [prescreen] Qwen raw: {output_text!r}")
-
-        # Step 5: Parse response
-        results = _parse_prescreen_output(output_text, boxes)
+        if not results and box_fallback != "off":
+            # Unusable reply (e.g. the bare "[1, 2]"): ask once more with a
+            # single whole-image box -- still a question the 3B model can
+            # answer, unlike the open-ended prompt.
+            whole = fallback_boxes(image_path, max_cand=1, mode="whole")
+            if whole:
+                print("  [prescreen] Parse failed -> retry with whole-image box")
+                results = _ask(whole, "whole")
 
         if not results:
             # Fallback to legacy mode if parsing fails
@@ -434,13 +595,20 @@ class QwenVLAnnotator:
 
         return results
 
-    def prescreen_generate_multi(self, image_path, n_runs=1, max_cand=5, tmp_dir=None):
+    def prescreen_generate_multi(self, image_path, n_runs=1, max_cand=5, tmp_dir=None,
+                                 box_fallback="quad"):
         """Multi-run prescreen with voting. Same interface as generate_multi."""
         from collections import Counter
 
         if n_runs <= 1:
             results = self.prescreen_generate(image_path, max_cand=max_cand,
-                                              tmp_dir=tmp_dir)
+                                              tmp_dir=tmp_dir,
+                                              box_fallback=box_fallback)
+            # Guard: only dict entries carrying tags are usable.  A parser
+            # regression used to hand a bare int here -> AttributeError on
+            # r.get("tags") (the 2026-10-15 crash).
+            results = [r for r in results
+                       if isinstance(r, dict) and r.get("tags")]
             if results:
                 # Return the first result with highest tag count
                 best = max(results, key=lambda r: len(r.get("tags", [])))
@@ -451,8 +619,11 @@ class QwenVLAnnotator:
         all_bboxes = []
         for _ in range(n_runs):
             results = self.prescreen_generate(image_path, max_cand=max_cand,
-                                              tmp_dir=tmp_dir)
+                                              tmp_dir=tmp_dir,
+                                              box_fallback=box_fallback)
             for r in results:
+                if not isinstance(r, dict):
+                    continue
                 all_tags.extend(r.get("tags", []))
                 all_bboxes.append(r.get("bbox", [0, 0, 0, 0]))
 
@@ -470,11 +641,15 @@ class QwenVLAnnotator:
         all_results = [self.generate(image_path, filename=filename) for _ in range(max(1, n_runs))]
         if n_runs <= 1:
             for objs in all_results:
-                if objs: return objs[0]
+                for o in objs:
+                    if isinstance(o, dict) and o.get("tags"):
+                        return o
             return {"tags":[], "bbox":[0,0,0,0]}
         all_tags, all_bboxes = [], []
         for objs in all_results:
             for o in objs:
+                if not isinstance(o, dict):
+                    continue                   # junk entry (see _normalize_items)
                 all_tags.extend(o.get("tags",[])); all_bboxes.append(o.get("bbox",[0,0,0,0]))
         if not all_tags: return {"tags":[], "bbox":[0,0,0,0]}
         tc = Counter(all_tags); top = [t for t,_ in tc.most_common(5)]
@@ -512,8 +687,25 @@ class QwenVLAnnotator:
             return {"answer": raw}
 
 
+def is_noncam_name(name):
+    """COD10K "NonCAM" rule -- SINGLE SOURCE OF TRUTH: dataloader_sam3.is_noncam.
+
+    Those 2960 train images contain no camouflaged object: the prepared GT is
+    all-zero and the 8th input channel (neg_flag) is 1 *because of this file-name
+    rule*.  A prior for them must therefore stay empty -- asking Qwen would only
+    invent objects.  Imported lazily so this module stays importable without
+    torch.  Any change to the rule must be made in dataloader_sam3, not here.
+    """
+    name = os.path.basename(str(name))
+    try:
+        from dataloader_sam3 import is_noncam
+        return bool(is_noncam(name))
+    except Exception:
+        return "NonCAM" in name
+
+
 def _annotate_loop(image_files, data_root, split, annotations, out_path, annotator,
-                   num_runs=1, mode="legacy", tmp_dir=None):
+                   num_runs=1, mode="legacy", tmp_dir=None, box_fallback="quad"):
     """Main annotation loop. mode='legacy' or 'prescreen'."""
     import tempfile as _tf
     _tmp = tmp_dir or _tf.mkdtemp(prefix="qwen_prescreen_")
@@ -523,10 +715,11 @@ def _annotate_loop(image_files, data_root, split, annotations, out_path, annotat
         try:
             if mode == "prescreen":
                 ann = annotator.prescreen_generate_multi(
-                    str(img_path), n_runs=num_runs, tmp_dir=_tmp)
+                    str(img_path), n_runs=num_runs, tmp_dir=_tmp,
+                    box_fallback=box_fallback)
             else:
                 ann = annotator.generate_multi(str(img_path), n_runs=num_runs, filename=img_path.name)
-            if not ann.get("tags"):
+            if not isinstance(ann, dict) or not ann.get("tags"):
                 print(f"[{idx}/{len(image_files)}] {name} -> SKIP (no tags)"); continue
             annotations.setdefault(split, {})[name] = ann
             print(f"[{idx}/{len(image_files)}] {name} -> tags={ann['tags']} bbox={ann.get('bbox')}")
@@ -541,7 +734,8 @@ def _annotate_loop(image_files, data_root, split, annotations, out_path, annotat
 
 
 def batch_annotate(data_root, out_path, split, model_path, max_images=-1, resume=True,
-                   filelist=None, gpus=None, num_runs=1, mode="legacy"):
+                   filelist=None, gpus=None, num_runs=1, mode="legacy",
+                   box_fallback="quad", noncam_policy="skip_train"):
     if gpus is None: gpus = [0]
     data_root = Path(data_root)
     image_files = sorted(p for p in data_root.iterdir()
@@ -555,19 +749,42 @@ def batch_annotate(data_root, out_path, split, model_path, max_images=-1, resume
         image_files = [p for p in image_files if p.name in allowed]
         print(f">>> filelist: {len(image_files)} images")
     if max_images > 0: image_files = image_files[:max_images]
-    print(f">>> Images: {len(image_files)}, gpus: {gpus}, num_runs: {num_runs}, mode: {mode}")
+
+    # COD10K "NonCAM" images have no camouflaged object (prepared GT is all-zero
+    # and the 8th input channel neg_flag=1 follows from the file name, see
+    # dataloader_sam3.is_noncam).  Their prior MUST stay empty, so there is
+    # nothing to ask Qwen.  Only the train split is skipped by default, because
+    # this json also feeds MyTest_SAM3's prior-coverage check.
+    if noncam_policy != "annotate" and (split == "train" or noncam_policy == "skip_all"):
+        n_before = len(image_files)
+        image_files = [p for p in image_files if not is_noncam_name(p.name)]
+        print(f">>> skip COD10K 'NonCAM': {n_before - len(image_files)} image(s) "
+              f"(no target in GT, neg_flag=1) -> {len(image_files)} left")
+
+    print(f">>> Images: {len(image_files)}, gpus: {gpus}, num_runs: {num_runs}, "
+          f"mode: {mode}, box_fallback: {box_fallback}")
     out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
     annotations = {}
     if resume and out_path.exists():
         with open(out_path, "r", encoding="utf-8") as f: annotations = json.load(f)
         print(f">>> Resume: {sum(len(v) for v in annotations.values())} existing")
+        if noncam_policy != "annotate":
+            # Housekeeping: drop stale NonCAM entries of this split so the json
+            # only describes images that really contain a target.
+            stale = [k for k in annotations.get(split, {}) if is_noncam_name(k)]
+            if stale:
+                for k in stale:
+                    annotations[split].pop(k, None)
+                print(f">>> Purged {len(stale)} NonCAM entry/entries from {split}")
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(annotations, f, ensure_ascii=False, indent=2)
     if len(gpus) > 1 and len(image_files) > 1:
         _run_multi_gpu(gpus, image_files, data_root, split, model_path, out_path,
-                       annotations, num_runs, mode=mode)
+                       annotations, num_runs, mode=mode, box_fallback=box_fallback)
     else:
         annotator = QwenVLAnnotator(model_path=model_path)
         _annotate_loop(image_files, data_root, split, annotations, out_path, annotator,
-                       num_runs=num_runs, mode=mode)
+                       num_runs=num_runs, mode=mode, box_fallback=box_fallback)
 
 
 def _run_shard_worker(opt, num_runs=1):
@@ -581,12 +798,13 @@ def _run_shard_worker(opt, num_runs=1):
     if opt.out_shard and os.path.exists(opt.out_shard):
         with open(opt.out_shard, "r", encoding="utf-8") as f: annotations = json.load(f)
     _annotate_loop(shard_files, data_root, opt.split, annotations, Path(opt.out_shard),
-                   annotator, num_runs=num_runs, mode=opt.mode)
+                   annotator, num_runs=num_runs, mode=opt.mode,
+                   box_fallback=getattr(opt, "box_fallback", "quad"))
 
 
 def _run_multi_gpu(gpus, image_files, data_root, split, model_path, out_path,
-                   base_annotations, num_runs=1, mode="legacy"):
-    import subprocess, sys, tempfile
+                   base_annotations, num_runs=1, mode="legacy", box_fallback="quad"):
+    import subprocess, sys, tempfile, shutil
     shards = [[] for _ in range(len(gpus))]
     pending = [f for f in image_files if f.name not in base_annotations.get(split, {})]
     for i, f in enumerate(pending): shards[i % len(gpus)].append(f.name)
@@ -597,22 +815,53 @@ def _run_multi_gpu(gpus, image_files, data_root, split, model_path, out_path,
         sp = os.path.join(tmp_dir, f"shard_gpu{gid}.json"); shard_paths.append(sp)
         lp = os.path.join(tmp_dir, f"list_gpu{gid}.json")
         with open(lp, "w", encoding="utf-8") as f: json.dump(shards[i], f)
-        cmd = [sys.executable, os.path.abspath(__file__), "--shard_mode", "--gpu_id", str(gid),
+        cmd = [sys.executable, "-u", os.path.abspath(__file__), "--shard_mode",
+               "--gpu_id", str(gid),
                "--shard_files", lp, "--data_root", str(data_root), "--split", split,
                "--model", model_path, "--out_shard", sp, "--num_runs", str(num_runs),
-               "--mode", mode]
+               "--mode", mode, "--box_fallback", box_fallback]
         env = os.environ.copy(); env["CUDA_VISIBLE_DEVICES"] = str(gid)
         print(f"  GPU {gid}: {len(shards[i])} images")
-        procs.append(subprocess.Popen(cmd, env=env))
-    for p in procs: p.wait()
-    import shutil; shutil.rmtree(tmp_dir, ignore_errors=True)
+        procs.append((gid, len(shards[i]), subprocess.Popen(cmd, env=env)))
+
+    failed = []
+    for gid, n_shard, p in procs:
+        rc = p.wait()
+        if rc != 0:
+            failed.append((gid, rc, n_shard))
+
+    # ---- merge FIRST, clean up AFTER -------------------------------------
+    # The old code ran shutil.rmtree(tmp_dir) *before* reading the per-GPU
+    # shard json files, so every multi-GPU run silently merged zero shards and
+    # only kept whatever was already in base_annotations.  Step1 still looked
+    # successful (it just re-wrote the previous json), which is exactly how a
+    # 2-GPU run can lose all of its new annotations without a single warning.
     annotations = dict(base_annotations)
+    n_merged = n_have = 0
     for sp in shard_paths:
-        if os.path.exists(sp):
-            with open(sp, "r", encoding="utf-8") as f:
-                for s, entries in json.load(f).items(): annotations.setdefault(s,{}).update(entries)
-    with open(out_path, "w", encoding="utf-8") as f: json.dump(annotations, f, ensure_ascii=False, indent=2)
-    print(f">>> Done! Total={sum(len(v) for v in annotations.values())}")
+        if not os.path.exists(sp):
+            print(f">>> WARNING: shard output missing: {sp}")
+            continue
+        with open(sp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        n_have += 1
+        for s, entries in data.items():
+            annotations.setdefault(s, {}).update(entries)
+            n_merged += len(entries)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(annotations, f, ensure_ascii=False, indent=2)
+    print(f">>> merged {n_merged} shard entries from {n_have}/{len(shard_paths)} "
+          f"shards; Total={sum(len(v) for v in annotations.values())}")
+
+    if failed or n_have < len(shard_paths):
+        # A dead shard used to look identical to a successful run: its images
+        # simply had no annotation and fell back to an all-zero prior.
+        for gid, rc, n_shard in failed:
+            print(f">>> ERROR: GPU {gid} shard ({n_shard} images) exited with "
+                  f"code {rc}")
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
@@ -629,6 +878,17 @@ if __name__ == "__main__":
                         choices=["legacy", "prescreen"],
                         help="prescreen: OpenCV detects + Qwen names (recommended for 3B). "
                              "legacy: Qwen open-ended (original)")
+    parser.add_argument("--box_fallback", type=str, default="quad",
+                        choices=["quad", "whole", "off"],
+                        help="What to do when the saliency proposer finds no candidate "
+                             "(or the reply is unparseable): quad=whole image + 4 "
+                             "quadrants (default), whole=whole image only, off=old "
+                             "behaviour (fall back to the open-ended prompt)")
+    parser.add_argument("--noncam_policy", type=str, default="skip_train",
+                        choices=["skip_train", "skip_all", "annotate"],
+                        help="COD10K 'NonCAM' images (GT all-zero, neg_flag=1, no target): "
+                             "skip_train=skip them in the train split only (default), "
+                             "skip_all=skip in both splits, annotate=keep old behaviour")
     parser.add_argument("--no_resume", action="store_true")
     parser.add_argument("--shard_mode", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--gpu_id", type=str, default=None, help=argparse.SUPPRESS)
@@ -642,4 +902,5 @@ if __name__ == "__main__":
         batch_annotate(opt.data_root, opt.out, opt.split, opt.model,
                        max_images=opt.max_images, resume=not opt.no_resume,
                        filelist=opt.filelist, gpus=gpu_list, num_runs=opt.num_runs,
-                       mode=opt.mode)
+                       mode=opt.mode, box_fallback=opt.box_fallback,
+                       noncam_policy=opt.noncam_policy)

@@ -16,14 +16,30 @@ from tqdm import tqdm
 
 
 
-def hybrid_e_loss(pred, mask):
-    """ Hybrid Eloss """
+def hybrid_e_loss(pred, mask, loss_mode="fixed"):
+    """Hybrid E-loss = weighted BCE + E-measure + weighted IoU.
+
+    loss_mode
+      fixed  - (default since 2026-10) ``weit`` really multiplies the per-pixel
+               BCE, so the 5x structure weight reaches the BCE branch.
+      legacy - the pre-2026-10 code.  ``reduction='mean'`` returned a *scalar*,
+               so ``(weit * wbce).sum((2,3)) / weit.sum((2,3))`` collapsed back
+               to that same scalar: the structure weight never influenced the
+               BCE term at all (it only reached E-loss / wIoU).  Kept only to
+               reproduce a number from before the fix.
+    """
     # adaptive weighting masks
     weit = 1 + 5 * torch.abs(F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15) - mask)
 
     # weighted binary cross entropy loss function
-    wbce = F.binary_cross_entropy_with_logits(pred, mask, reduction='mean')
-    wbce = ((weit * wbce).sum(dim=(2, 3)) + 1e-8) / (weit.sum(dim=(2, 3)) + 1e-8)
+    if loss_mode == "legacy":
+        wbce = F.binary_cross_entropy_with_logits(pred, mask, reduction='mean')
+        wbce = ((weit * wbce).sum(dim=(2, 3)) + 1e-8) / (weit.sum(dim=(2, 3)) + 1e-8)
+    elif loss_mode == "fixed":
+        bce = F.binary_cross_entropy_with_logits(pred, mask, reduction='none')
+        wbce = (weit * bce).sum(dim=(2, 3)) / (weit.sum(dim=(2, 3)) + 1e-8)
+    else:
+        raise ValueError("loss_mode must be 'fixed' or 'legacy', got %r" % (loss_mode,))
 
     # weighted e loss function
     pred = torch.sigmoid(pred)
@@ -72,8 +88,11 @@ def train(train_loader, model, optimizer, epoch, save_path, step_counter):
                 edge, cam_out_2, cam_out_3, cam_out_4 = model(images)
 
                 # ---- loss function ----
-                loss_g = hybrid_e_loss(edge, gts)
-                loss_c = hybrid_e_loss(cam_out_2, gts) + hybrid_e_loss(cam_out_3, gts) + hybrid_e_loss(cam_out_4, gts)
+                _lm = getattr(opt, 'loss_mode', 'fixed')
+                loss_g = hybrid_e_loss(edge, gts, _lm)
+                loss_c = (hybrid_e_loss(cam_out_2, gts, _lm)
+                          + hybrid_e_loss(cam_out_3, gts, _lm)
+                          + hybrid_e_loss(cam_out_4, gts, _lm))
                 loss = loss_g + loss_c
 
                 # ---- backward ----
@@ -154,6 +173,10 @@ if __name__ == '__main__':
     parser.add_argument('--batchsize', type=int, default=8, help='training batch size')
     parser.add_argument('--trainsize', type=int, default=352, help='training dataset size')
     parser.add_argument('--clip', type=float, default=0.5, help='gradient clipping margin')
+    parser.add_argument('--loss_mode', type=str, default='fixed', choices=['fixed', 'legacy'],
+                        help="'fixed' (default): the structure weight really scales BCE; "
+                             "'legacy': reproduce the pre-2026-10 loss where reduction='mean' "
+                             "collapsed the weight before it could be applied")
     parser.add_argument('--decay_rate', type=float, default=0.1, help='decay rate of learning rate')
     parser.add_argument('--decay_epoch', type=int, default=50, help='every n epochs decay learning rate')
     parser.add_argument('--model', type=str, default='PVTv2-B2',

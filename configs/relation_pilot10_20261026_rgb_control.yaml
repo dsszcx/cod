@@ -1,0 +1,17 @@
+version: relation_pilot10_20261026_rgb_control
+seed: 20261022
+paths:
+  manifests: outputs/RELATION_TRAIN_PREP_V1
+  imagenet: /srv/cod-workspace/pretrained/pvt_v2_b2.pth
+  out_dir: outputs/RELATION_PILOT10_20261026_RGB_CONTROL
+arms: [rgb]
+epochs: 2
+input_size: 352
+batch_size: 2
+learning_rate: 0.0001
+weight_decay: 0.0001
+workers: 0
+amp: false
+node_geometry: false
+deterministic_algorithms: true
+deadline_utc: '2026-10-26T03:54:37+00:00'
