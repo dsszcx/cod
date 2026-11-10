@@ -1,5 +1,7 @@
 # 文档索引
 
+- [2026-11-10 融合研究进展](experiments/fusion-progress-20261110.md)汇总 CAM-only 80 轮四指标、前向开销、候选几何诊断和空间融合对照。
+
 - `project/`：当前有效的项目说明、进度、要求和交付清单。
 - `experiments/`：Layer-0、E0–E4 和 SAM3 的实验记录与证据。
 - `deployment/`：服务器部署、分享、权重和大文件说明。
