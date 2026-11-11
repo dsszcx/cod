@@ -2,6 +2,8 @@
 
 - [2026-11-10 融合研究进展](experiments/fusion-progress-20261110.md)汇总 CAM-only 80 轮四指标、前向开销、候选几何诊断和空间融合对照。
 - [2026-11-11 独立种子 80 轮结果](experiments/独立种子80轮复核结果_20261111.md)与[空间融合 10 轮结果](experiments/候选内部空间融合结果_20261111.md)包含 raw、标准 PNG、分组退化和后续安排。
+- [候选提示词对照](experiments/候选提示词对照结果_20261111.md)、[弱角色与背景候选干预](experiments/弱角色与背景候选干预结果_20261111.md)和[SAM3 四例阈值诊断](experiments/SAM阈值四例诊断_20261111.md)记录生成与融合的正负结果。
+- [CamoFormer／ESCNet 阅读与接入建议](references/融合模块阅读与接入建议_20261111.md)记录已核对的模块操作和下一轮对照设计。
 
 - `project/`：当前有效的项目说明、进度、要求和交付清单。
 - `experiments/`：Layer-0、E0–E4 和 SAM3 的实验记录与证据。
